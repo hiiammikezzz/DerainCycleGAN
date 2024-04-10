@@ -6,7 +6,7 @@ from torch.optim import lr_scheduler
 import torch.nn.functional as F
 import os
 import torchvision.models as models
-
+import torchfile
 ####################################################################
 #------------------------- Discriminators --------------------------
 ####################################################################
