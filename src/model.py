@@ -25,8 +25,8 @@ class DerainCycleGAN(nn.Module):
 
     # vgg
     self.vgg = networks.Vgg16()
-    networks.init_vgg16('../vgg16/')
-    self.vgg.load_state_dict(torch.load(os.path.join('../vgg16/', "vgg16.weight")))
+    networks.init_vgg16('/content/DerainCycleGAN/vgg16')
+    self.vgg.load_state_dict(torch.load(os.path.join('/content/DerainCycleGAN/vgg16/', "vgg16.weight")))
 
     # optimizers
     self.disA_opt = torch.optim.Adam(self.disA.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=0.0001)
