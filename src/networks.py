@@ -312,6 +312,8 @@ def init_vgg16(model_folder):
 			os.system(				# 下载vgg16.t7文件
 				'wget http://cs.stanford.edu/people/jcjohns/fast-neural-style/models/vgg16.t7 -O ' + os.path.join(model_folder, 'vgg16.t7'))
 		#vgglua = load_lua(os.path.join(model_folder, 'vgg16.t7'))
+		#vgglua = load_lua(os.path.join(model_dir, 'vgg16.t7'),long_size =8 ）
+
 		vgglua = torchfile.load(os.path.join(model_folder, 'vgg16.t7'))
 		vgg = Vgg16()
 		for (src, dst) in zip(vgglua.parameters()[0], vgg.parameters()):
