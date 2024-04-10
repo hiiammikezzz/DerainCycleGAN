@@ -1,292 +1,614 @@
-import networks
-import torch
+import  torch
 import torch.nn as nn
+from torch.autograd import Variable
+import functools
+from torch.optim import lr_scheduler
+import torch.nn.functional as F
 import os
-import pickle
-from utils import *
+import torchvision.models as models
+import torchfile
+####################################################################
+#------------------------- Discriminators --------------------------
+####################################################################
+class MultiScaleDis(nn.Module):
+  def __init__(self, input_dim, n_scale=3, n_layer=4, norm='None', sn=False):
+    super(MultiScaleDis, self).__init__()
+    ch = 64
+    self.downsample = nn.AvgPool2d(3, stride=2, padding=1, count_include_pad=False)
+    self.Diss = nn.ModuleList()
+    for _ in range(n_scale):
+      self.Diss.append(self._make_net(ch, input_dim, n_layer, norm, sn))
 
-class DerainCycleGAN(nn.Module):
-  def __init__(self, opts):
-    super(DerainCycleGAN, self).__init__()
-
-    # parameters
-    lr = 0.0001
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
-    # discriminators        
-    self.disA = networks.MultiScaleDis(opts.input_dim_a, opts.dis_scale, norm=opts.dis_norm, sn=opts.dis_spectral_norm)
-    self.disB = networks.MultiScaleDis(opts.input_dim_b, opts.dis_scale, norm=opts.dis_norm, sn=opts.dis_spectral_norm)
-
-    # urad 
-    self.urad = networks.URAD()
-
-    # generator
-    self.genA = networks.Gen()
-    self.genB = networks.Gen()      
-
-    # vgg
-    self.vgg = networks.Vgg16()
-    networks.init_vgg16('./DerainCycleGAN/vgg16')
-    self.vgg.load_state_dict(torch.load(os.path.join('./DerainCycleGAN/vgg16/', "vgg16.weight")))
-
-    # optimizers
-    self.disA_opt = torch.optim.Adam(self.disA.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=0.0001)
-    self.disB_opt = torch.optim.Adam(self.disB.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=0.0001)
-    self.urad_opt = torch.optim.Adam(self.urad.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=0.0001)    
-    self.genA_opt = torch.optim.Adam(self.genA.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=0.0001)
-    self.genB_opt = torch.optim.Adam(self.genB.parameters(), lr=lr, betas=(0.5, 0.999), weight_decay=0.0001)
-
-    # Setup the loss function for training
-    self.criterionL1 = torch.nn.L1Loss()
-    self.criterionL2 = torch.nn.MSELoss()
-    self.criterionGAN = GANLoss(opts.gan_mode).cuda(opts.gpu)    
-
-    # create image buffer to store previously generated images
-    self.fake_A_pool = ImagePool(opts.pool_size)  
-    self.fake_B_pool = ImagePool(opts.pool_size) 
-    
-  def initialize(self):
-    self.disA.apply(networks.gaussian_weights_init)
-    self.disB.apply(networks.gaussian_weights_init)
-    self.urad.apply(networks.gaussian_weights_init)
-    self.genA.apply(networks.gaussian_weights_init)
-    self.genB.apply(networks.gaussian_weights_init)
-
-  def set_scheduler(self, opts, last_ep=0):
-    self.disA_sch = networks.get_scheduler(self.disA_opt, opts, last_ep)
-    self.disB_sch = networks.get_scheduler(self.disB_opt, opts, last_ep)
-    self.urad_sch = networks.get_scheduler(self.urad_opt, opts, last_ep)
-    self.genA_sch = networks.get_scheduler(self.genA_opt, opts, last_ep)
-    self.genB_sch = networks.get_scheduler(self.genB_opt, opts, last_ep)    
-
-  def setgpu(self, gpu):
-    self.gpu = gpu
-    self.disA.cuda(self.gpu)
-    self.disB.cuda(self.gpu)
-    self.urad.cuda(self.gpu)
-    self.genA.cuda(self.gpu)
-    self.genB.cuda(self.gpu)    
-    self.vgg.cuda(self.gpu)
-
-  def get_z_random(self, batchSize, nz, random_type='gauss'):                     # 
-    z = torch.randn(batchSize, nz).cuda(self.gpu)
-    return z
-
-  def test_forward(self, image1, image2=None, a2b=None):
-    if a2b:
-        self.mask_a = self.urad(image1)
-        self.frame1_a, self.frame2_a, self.fake_A_encoded = self.genA.forward(image1, self.mask_a[5])  
+  def _make_net(self, ch, input_dim, n_layer, norm, sn):
+    model = []
+    model += [LeakyReLUConv2d(input_dim, ch, 4, 2, 1, norm, sn)]
+    tch = ch
+    for _ in range(1, n_layer):
+      model += [LeakyReLUConv2d(tch, tch * 2, 4, 2, 1, norm, sn)]
+      tch *= 2
+    if sn:
+      model += [spectral_norm(nn.Conv2d(tch, 1, 1, 1, 0))]
     else:
-        self.mask_a = self.urad(image1)
-        batch_size, row, col = self.mask_a[5].size(0), self.mask_a[5].size(2), self.mask_a[5].size(3)
-        noise = (torch.rand(batch_size, 1, row, col) * 0.01).cuda()
-        self.mask_a[5] = self.mask_a[5] + noise
-        self.frame1_b, self.frame2_b, self.fake_A_encoded = self.genB.forward(image2, self.mask_a[5])  
-    return self.fake_A_encoded
+      model += [nn.Conv2d(tch, 1, 1, 1, 0)]
+    return nn.Sequential(*model)
 
-  def forward(self, ep, opts):
-    '''self.real_A_encoded -> self.fake_A_encoded -> self.real_A_recon'''
-    '''self.real_B_encoded -> self.fake_B_encoded -> self.real_B_recon'''    
-    # input images
-    real_A = self.input_A
-    real_B = self.input_B
-    self.real_A_encoded = real_A    
-    self.real_B_encoded = real_B   
+  def forward(self, x):
+    outs = []
+    for Dis in self.Diss:
+      outs.append(Dis(x))
+      x = self.downsample(x)
+    return outs
 
-    # get first cycle
-    '''self.real_A_encoded -> self.fake_A_encoded'''
-    '''self.real_B_encoded -> self.fake_B_encoded'''    
-    self.mask_a = self.urad(self.real_A_encoded)
-    self.frame1_a, self.frame2_a, self.fake_A_encoded = self.genA.forward(self.real_A_encoded, self.mask_a[5])  
-    self.mask_b = self.urad(self.real_B_encoded)
-    self.frame1_b, self.frame2_b, self.fake_B_encoded = self.genB.forward(self.real_B_encoded, self.mask_b[5]) 
+####################################################################
+#--------------------------- URAD ----------------------------
+####################################################################
+ITERATION = 6
+class URAD(nn.Module):
+    def __init__(self):
+        super(URAD, self).__init__()
+        self.det_conv0 = nn.Sequential(
+            nn.Conv2d(4, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.det_conv1 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.det_conv2 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.det_conv3 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.det_conv4 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.det_conv5 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.conv_i = nn.Sequential(
+            nn.Conv2d(32 + 32, 32, 3, 1, 1),
+            nn.Sigmoid()
+            )
+        self.conv_f = nn.Sequential(
+            nn.Conv2d(32 + 32, 32, 3, 1, 1),
+            nn.Sigmoid()
+            )
+        self.conv_g = nn.Sequential(
+            nn.Conv2d(32 + 32, 32, 3, 1, 1),
+            nn.Tanh()
+            )
+        self.conv_o = nn.Sequential(
+            nn.Conv2d(32 + 32, 32, 3, 1, 1),
+            nn.Sigmoid()
+            )
+        self.det_conv_mask = nn.Sequential(
+            nn.Conv2d(32, 1, 3, 1, 1),
+            )
 
-    # get perceptual loss
-    self.perc_real_A = self.vgg(self.real_A_encoded).detach()
-    self.perc_fake_A = self.vgg(self.fake_A_encoded).detach()
+    def forward(self, input):
+        batch_size, row, col = input.size(0), input.size(2), input.size(3)
+        mask = Variable(torch.ones(batch_size, 1, row, col)).cuda() / 2.
+        h = Variable(torch.zeros(batch_size, 32, row, col)).cuda() 
+        c = Variable(torch.zeros(batch_size, 32, row, col)).cuda()
+        mask_list = []
+        for i in range(ITERATION):
+            x = torch.cat((input, mask), 1)
+            x = self.det_conv0(x)
 
-    # get second cycle
-    '''self.fake_A_encoded -> self.real_A_recon'''
-    '''self.fake_B_encoded -> self.real_B_recon'''    
-    self.mask_b2 = self.urad(self.fake_B_encoded)
-    self.frame1_b2, self.frame2_b2, self.real_B_recon = self.genA.forward(self.fake_B_encoded, self.mask_b2[5])  
-    self.mask_a2 = self.urad(self.fake_A_encoded)
-    self.frame1_a2, self.frame2_a2, self.real_A_recon = self.genB.forward(self.fake_A_encoded, self.mask_a2[5]) 
+            x = torch.cat((x, h), 1)
+            i = self.conv_i(x)
+            f = self.conv_f(x)
+            g = self.conv_g(x)
+            o = self.conv_o(x)
+            c = f * c + i * g
+            h = o * F.tanh(c)
 
-    self.image_display = torch.cat((self.real_A_encoded[0:1].detach().cpu(), self.fake_A_encoded[0:1].detach().cpu(), \
-                                    self.real_A_recon[0:1].detach().cpu(), \
-                                    self.real_B_encoded[0:1].detach().cpu(), self.fake_B_encoded[0:1].detach().cpu(), \
-                                    self.real_B_recon[0:1].detach().cpu()), dim=0)
+            x = h
+            resx = x
+            x = F.relu(self.det_conv1(x) + resx)
+            resx = x
+            x = F.relu(self.det_conv2(x) + resx)
+            resx = x
+            x = F.relu(self.det_conv3(x) + resx)
+            resx = x
+            x = F.relu(self.det_conv4(x) + resx)
+            resx = x
+            x = F.relu(self.det_conv5(x) + resx)
+            mask = self.det_conv_mask(x)
+            mask_list.append(mask)
 
-  def update_D(self, opts):
-    self.fake_A_encoded = self.fake_A_pool.query(self.fake_A_encoded)
-    self.fake_B_encoded = self.fake_B_pool.query(self.fake_B_encoded)
+        return mask_list
+
+####################################################################
+#--------------------------- Generators ----------------------------
+####################################################################
+class Gen(nn.Module):
+    def __init__(self):
+        super(Gen, self).__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(4, 64, 5, 1, 2),
+            nn.ReLU()
+            )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, 2, 1),
+            nn.ReLU()
+            )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 2, 1),
+            nn.ReLU()
+            )
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.conv6 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.diconv1 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 2, dilation = 2),
+            nn.ReLU()
+            )
+        self.diconv2 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 4, dilation = 4),
+            nn.ReLU()
+            )
+        self.diconv3 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 8, dilation = 8),
+            nn.ReLU()
+            )
+        self.diconv4 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 16, dilation = 16),
+            nn.ReLU()
+            )
+        self.conv7 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.conv8 = nn.Sequential(
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.deconv1 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.ReflectionPad2d((1, 0, 1, 0)),
+            nn.AvgPool2d(2, stride = 1),
+            nn.ReLU()
+            )
+        self.conv9 = nn.Sequential(
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.deconv2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.ReflectionPad2d((1, 0, 1, 0)),
+            nn.AvgPool2d(2, stride = 1),
+            nn.ReLU()
+            )
+        self.conv10 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.outframe1 = nn.Sequential(
+            nn.Conv2d(256, 3, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.outframe2 = nn.Sequential(
+            nn.Conv2d(128, 3, 3, 1, 1),
+            nn.ReLU()
+            )
+        self.output = nn.Sequential(
+            nn.Conv2d(32, 3, 3, 1, 1)
+            )
+
+    def forward(self, input, mask):
+        x = torch.cat((input, mask), 1)
+        x = self.conv1(x)
     
-    # update disA
-    self.disA_opt.zero_grad()
-    loss_D1_A = self.backward_D_basic(self.disA, self.real_A_encoded, self.fake_B_encoded)    
-    self.disA_loss = loss_D1_A.item()
-    self.disA_opt.step()
+        res1 = x
+        x = self.conv2(x)
+        # pdb.set_trace()            
+        x = self.conv3(x)
+        res2 = x
+        x = self.conv4(x)
+        x = self.conv5(x)
+        x = self.conv6(x)
+        x = self.diconv1(x)
+        x = self.diconv2(x)
+        x = self.diconv3(x)
+        x = self.diconv4(x)
+        x = self.conv7(x)
+        x = self.conv8(x)
+        frame1 = self.outframe1(x)
+        x = self.deconv1(x)
 
-    # update disB
-    self.disB_opt.zero_grad()
-    loss_D1_B = self.backward_D_basic(self.disB, self.real_B_encoded, self.fake_A_encoded)    
-    self.disB_loss = loss_D1_B.item()
-    self.disB_opt.step()
+        x = x + res2
+        x = self.conv9(x)
+        frame2 = self.outframe2(x)
+        x = self.deconv2(x)
+        x = x + res1
+        x = self.conv10(x)
+        x = self.output(x)
+        return frame1, frame2, x
 
-  def backward_D_basic(self, netD, real, fake):
-      # Real
-      pred_real = netD(real)
-      loss_D_real1 = self.criterionGAN(pred_real[0], True)
-      loss_D_real2 = self.criterionGAN(pred_real[1], True)
-      loss_D_real3 = self.criterionGAN(pred_real[2], True)    
-      loss_D_real = (loss_D_real1 + loss_D_real2 + loss_D_real3) / 3   
+####################################################################
+#--------------------------- Vgg16 ----------------------------
+####################################################################
+class Vgg16(torch.nn.Module):
+    def __init__(self):
+        super(Vgg16, self).__init__()
+        self.conv1_1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
+        self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
 
-      # Fake
-      pred_fake = netD(fake.detach())
-      loss_D_fake1 = self.criterionGAN(pred_fake[0], False)
-      loss_D_fake2 = self.criterionGAN(pred_fake[1], False)
-      loss_D_fake3 = self.criterionGAN(pred_fake[2], False)  
-      loss_D_fake = (loss_D_fake1 + loss_D_fake2 + loss_D_fake3) / 3      
+        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.conv2_2 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1)
 
-      loss_D = (loss_D_real + loss_D_fake) * 0.5
-      loss_D.backward()
-      return loss_D
+        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
+        self.conv3_3 = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
 
-  def update_EG(self, image_a, image_b, ep, opts):
-    self.input_A = image_a
-    self.input_B = image_b    
-    self.forward(ep, opts)
-    
-    self.urad_opt.zero_grad()
-    self.genA_opt.zero_grad()    
-    self.genB_opt.zero_grad()    
-    self.backward_EG(opts)
-    self.urad_opt.step()
-    self.genA_opt.step()
-    self.genB_opt.step()    
+        self.conv4_1 = nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1)
+        self.conv4_2 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
+        self.conv4_3 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
 
-  def backward_EG(self, opts):
-    # adversarial loss
-    loss_G_GAN_A = self.criterionGAN(self.disA(self.fake_B_encoded)[0], True)
-    loss_G_GAN_B = self.criterionGAN(self.disB(self.fake_A_encoded)[0], True)  
+        self.conv5_1 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
+        self.conv5_2 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
+        self.conv5_3 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
 
-    # cross cycle consistency loss
-    loss_G_L1_A = self.criterionL1(self.real_A_recon, self.real_A_encoded) * 10
-    loss_G_L1_B = self.criterionL1(self.real_B_recon, self.real_B_encoded) * 10
+    def forward(self, X):
+        h = F.relu(self.conv1_1(X))
+        h = F.relu(self.conv1_2(h))
+        relu1_2 = h
+        h = F.max_pool2d(h, kernel_size=2, stride=2)
 
-    # perceptual loss
-    loss_perceptual = self.criterionL2(self.perc_fake_A, self.perc_real_A) * 0.01
+        h = F.relu(self.conv2_1(h))
+        h = F.relu(self.conv2_2(h))
+        relu2_2 = h
+        h = F.max_pool2d(h, kernel_size=2, stride=2)
 
-    # atten loss
-    # cha1, row1, col1 = self.mask_a[3].shape[1], self.mask_a[3].shape[2], self.mask_a[3].shape[3]
-    # mask_a_gt = torch.rand(opts.batch_size, cha1, row1, col1).cuda() 
-    # loss_att_a = self.criterionL2(self.mask_a[5], mask_a_gt) * 10
+        h = F.relu(self.conv3_1(h))
+        h = F.relu(self.conv3_2(h))
+        h = F.relu(self.conv3_3(h))
+        relu3_3 = h
+        h = F.max_pool2d(h, kernel_size=2, stride=2)
 
-    cha2, row2, col2 = self.mask_b[3].shape[1], self.mask_b[3].shape[2], self.mask_b[3].shape[3]
-    mask_b_gt = torch.zeros(opts.batch_size, cha2, row2, col2).cuda() 
-    loss_att_b = self.criterionL2(self.mask_b[5], mask_b_gt) * 10
+        h = F.relu(self.conv4_1(h))
+        h = F.relu(self.conv4_2(h))
+        h = F.relu(self.conv4_3(h))
+        relu4_3 = h
+        h = F.max_pool2d(h, kernel_size=2, stride=2)
 
-    # Consistency loss
-    fake = self.mask_a[5] + self.fake_A_encoded
-    loss_cons = self.criterionL2(fake, self.real_A_encoded) * 10   
-  
-    loss_G = loss_G_GAN_A + loss_G_GAN_B + \
-             loss_G_L1_A + loss_G_L1_B + \
-             loss_perceptual + \
-             loss_cons + \
-             loss_att_b
+        h = F.relu(self.conv5_1(h))
+        h = F.relu(self.conv5_2(h))
+        h = F.relu(self.conv5_3(h))
+        relu4_4 = h           
+        h = F.max_pool2d(h, kernel_size=2, stride=2)
+        
+        return relu3_3
 
-    loss_G.backward(retain_graph=True)
+def init_vgg16(model_folder):
+    """load the vgg16 model feature"""
+    if not os.path.exists(os.path.join(model_folder, 'vgg16.weight')):
+        if not os.path.exists(os.path.join(model_folder, 'vgg16.pth')):
+            os.system(
+                'wget https://download.pytorch.org/models/vgg16-397923af.pth ' + os.path.join(model_folder, 'vgg16.pth'))
+        #vgglua = load_lua(os.path.join(model_folder, 'vgg16.t7'))
+        #vgglua = load_lua(os.path.join(model_dir, 'vgg16.t7'),long_size =8 ）
+	      #vgglua = torchfile.load(os.path.join(model_folder, 'vgg16.pth'))
+        vgglua = torch.load(os.path.join(model_folder, 'vgg16.pth'))
+        vgg = Vgg16()
+        vgg.load_state_dict(vgglua, strict=False)
+	#for src, dst in zip(vgg.parameters(), vgg.parameters()):
+        #    dst.data[:] = src    
+        torch.save(vgg.state_dict(), os.path.join(model_folder, 'vgg16.weight'))
 
-    self.gan_loss_a = loss_G_GAN_A.item()
-    self.gan_loss_b = loss_G_GAN_B.item()
-    self.l1_recon_A_loss = loss_G_L1_A.item()
-    self.l1_recon_B_loss = loss_G_L1_B.item()
-    self.perceptual_loss = loss_perceptual.item()
-    # self.atten_loss_a = loss_att_a.item()    
-    self.atten_loss_b = loss_att_b.item()
-    self.cons_loss = loss_cons.item()   
-    self.G_loss = loss_G.item()
+def define_vgg(path):
+    vgg = Vgg16()
+    init_vgg16(path)
+    vgg.load_state_dict(torch.load(os.path.join(path, "vgg16.weight")))
+    vgg = vgg.cuda()
+    return vgg
 
-  def update_lr(self):
-    self.disA_sch.step()
-    self.disB_sch.step()
-    self.urad_sch.step()
-    self.genA_sch.step()
-    self.genB_sch.step()
+####################################################################
+#------------------------- Basic Functions -------------------------
+####################################################################
+def get_scheduler(optimizer, opts, cur_ep=-1):
+  if opts.lr_policy == 'lambda':
+    def lambda_rule(ep):
+      lr_l = 1.0 - max(0, ep - opts.n_ep_decay) / float(opts.n_ep - opts.n_ep_decay + 1)
+      return lr_l
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda_rule, last_epoch=cur_ep)
+  elif opts.lr_policy == 'step':
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=opts.n_ep_decay, gamma=0.1, last_epoch=cur_ep)
+  else:
+    return NotImplementedError('no such learn rate policy')
+  return scheduler
 
-  def resume(self, model_dir, train=True):
-    checkpoint = torch.load(model_dir)
-    # weight
-    if train:
-      self.disA.load_state_dict(checkpoint['disA'])
-      self.disB.load_state_dict(checkpoint['disB'])
-    self.urad.load_state_dict(checkpoint['atten'])
-    self.genA.load_state_dict(checkpoint['genA'])
-    self.genB.load_state_dict(checkpoint['genB'])
-    # optimizer
-    if train:
-      self.disA_opt.load_state_dict(checkpoint['disA_opt'])
-      self.disB_opt.load_state_dict(checkpoint['disB_opt'])
-      self.urad_opt.load_state_dict(checkpoint['atten_opt'])
-      self.genA_opt.load_state_dict(checkpoint['genA_opt'])
-      self.genB_opt.load_state_dict(checkpoint['genB_opt'])
-    return checkpoint['ep'], checkpoint['total_it']
+def meanpoolConv(inplanes, outplanes):
+  sequence = []
+  sequence += [nn.AvgPool2d(kernel_size=2, stride=2)]
+  sequence += [nn.Conv2d(inplanes, outplanes, kernel_size=1, stride=1, padding=0, bias=True)]
+  return nn.Sequential(*sequence)
 
-  def save(self, filename, ep, total_it):
-    state = {
-             'disA': self.disA.state_dict(),
-             'disB': self.disB.state_dict(),
-             'atten': self.urad.state_dict(),
-             'genA': self.genA.state_dict(),
-             'genB': self.genB.state_dict(),
-             'disA_opt': self.disA_opt.state_dict(),
-             'disB_opt': self.disB_opt.state_dict(),
-             'atten_opt': self.urad_opt.state_dict(),
-             'genA_opt': self.genA_opt.state_dict(),
-             'genB_opt': self.genB_opt.state_dict(),
-             'ep': ep,
-             'total_it': total_it
-              }
-    torch.save(state, filename)
+def convMeanpool(inplanes, outplanes):
+  sequence = []
+  sequence += conv3x3(inplanes, outplanes)
+  sequence += [nn.AvgPool2d(kernel_size=2, stride=2)]
+  return nn.Sequential(*sequence)
+
+def get_norm_layer(layer_type='instance'):
+  if layer_type == 'batch':
+    norm_layer = functools.partial(nn.BatchNorm2d, affine=True)
+  elif layer_type == 'instance':
+    norm_layer = functools.partial(nn.InstanceNorm2d, affine=False)
+  elif layer_type == 'none':
+    norm_layer = None
+  else:
+    raise NotImplementedError('normalization layer [%s] is not found' % layer_type)
+  return norm_layer
+
+def get_non_linearity(layer_type='relu'):
+  if layer_type == 'relu':
+    nl_layer = functools.partial(nn.ReLU, inplace=True)
+  elif layer_type == 'lrelu':
+    nl_layer = functools.partial(nn.LeakyReLU, negative_slope=0.2, inplace=False)
+  elif layer_type == 'elu':
+    nl_layer = functools.partial(nn.ELU, inplace=True)
+  else:
+    raise NotImplementedError('nonlinearity activitation [%s] is not found' % layer_type)
+  return nl_layer
+
+def conv3x3(in_planes, out_planes):
+  return [nn.ReflectionPad2d(1), nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=1, padding=0, bias=True)]
+
+def gaussian_weights_init(m):
+  classname = m.__class__.__name__
+  if classname.find('Conv') != -1 and classname.find('Conv') == 0:
+    m.weight.data.normal_(0.0, 0.02)
+
+####################################################################
+#-------------------------- Basic Blocks --------------------------
+####################################################################
+class LayerNorm(nn.Module):
+  def __init__(self, n_out, eps=1e-5, affine=True):
+    super(LayerNorm, self).__init__()
+    self.n_out = n_out
+    self.affine = affine
+    if self.affine:
+      self.weight = nn.Parameter(torch.ones(n_out, 1, 1))
+      self.bias = nn.Parameter(torch.zeros(n_out, 1, 1))
     return
+  def forward(self, x):
+    normalized_shape = x.size()[1:]
+    if self.affine:
+      return F.layer_norm(x, normalized_shape, self.weight.expand(normalized_shape), self.bias.expand(normalized_shape))
+    else:
+      return F.layer_norm(x, normalized_shape)
 
-  def save_dict(self, obj, name):
-    with open(name + '.pkl', 'wb') as f:
-        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+class BasicBlock(nn.Module):
+  def __init__(self, inplanes, outplanes, norm_layer=None, nl_layer=None):
+    super(BasicBlock, self).__init__()
+    layers = []
+    if norm_layer is not None:
+      layers += [norm_layer(inplanes)]
+    layers += [nl_layer()]
+    layers += conv3x3(inplanes, inplanes)
+    if norm_layer is not None:
+      layers += [norm_layer(inplanes)]
+    layers += [nl_layer()]
+    layers += [convMeanpool(inplanes, outplanes)]
+    self.conv = nn.Sequential(*layers)
+    self.shortcut = meanpoolConv(inplanes, outplanes)
+  def forward(self, x):
+    out = self.conv(x) + self.shortcut(x)
+    return out
 
-  def load_dict(self, name):
-    with open(name + '.pkl', 'rb') as f:
-        return pickle.load(f)    
+class LeakyReLUConv2d(nn.Module):
+  def __init__(self, n_in, n_out, kernel_size, stride, padding=0, norm='None', sn=False):
+    super(LeakyReLUConv2d, self).__init__()
+    model = []
+    model += [nn.ReflectionPad2d(padding)]
+    if sn:
+      model += [spectral_norm(nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True))]
+    else:
+      model += [nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True)]
+    if 'norm' == 'Instance':
+      model += [nn.InstanceNorm2d(n_out, affine=False)]
+    model += [nn.LeakyReLU(inplace=True)]
+    self.model = nn.Sequential(*model)
+    self.model.apply(gaussian_weights_init)
+    #elif == 'Group'
+  def forward(self, x):
+    return self.model(x)
 
-  def assemble_outputs(self):
-    images_a = self.normalize_image(self.real_A_encoded).detach()
-    images_b = self.normalize_image(self.real_B_encoded).detach()
-    images_a1 = self.normalize_image(self.fake_A_encoded).detach()
-    images_a3 = self.normalize_image(self.real_A_recon).detach()
-    images_b1 = self.normalize_image(self.fake_B_encoded).detach()
-    images_b3 = self.normalize_image(self.real_B_recon).detach()
-    images_mask_a1 = self.normalize_image(self.mask_a[0]).detach()
-    images_mask_a2 = self.normalize_image(self.mask_a[1]).detach()
-    images_mask_a3 = self.normalize_image(self.mask_a[2]).detach()
-    images_mask_a4 = self.normalize_image(self.mask_a[3]).detach()
-    images_mask_a5 = self.normalize_image(self.mask_a[4]).detach()
-    images_mask_a6 = self.normalize_image(self.mask_a[5]).detach()
+class ReLUINSConv2d(nn.Module):
+  def __init__(self, n_in, n_out, kernel_size, stride, padding=0):
+    super(ReLUINSConv2d, self).__init__()
+    model = []
+    model += [nn.ReflectionPad2d(padding)]
+    model += [nn.Conv2d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=0, bias=True)]
+    model += [nn.InstanceNorm2d(n_out, affine=False)]
+    model += [nn.ReLU(inplace=True)]
+    self.model = nn.Sequential(*model)
+    self.model.apply(gaussian_weights_init)
+  def forward(self, x):
+    return self.model(x)
 
-    images_mask_b1 = self.normalize_image(self.mask_b[0]).detach()
-    images_mask_b2 = self.normalize_image(self.mask_b[1]).detach()
-    images_mask_b3 = self.normalize_image(self.mask_b[2]).detach()
-    images_mask_b4 = self.normalize_image(self.mask_b[3]).detach()
-    images_mask_b5 = self.normalize_image(self.mask_b[4]).detach()
-    images_mask_b6 = self.normalize_image(self.mask_b[5]).detach()
+class INSResBlock(nn.Module):
+  def conv3x3(self, inplanes, out_planes, stride=1):
+    return [nn.ReflectionPad2d(1), nn.Conv2d(inplanes, out_planes, kernel_size=3, stride=stride)]
+  def __init__(self, inplanes, planes, stride=1, dropout=0.0):
+    super(INSResBlock, self).__init__()
+    model = []
+    model += self.conv3x3(inplanes, planes, stride)
+    model += [nn.InstanceNorm2d(planes)]
+    model += [nn.ReLU(inplace=True)]
+    model += self.conv3x3(planes, planes)
+    model += [nn.InstanceNorm2d(planes)]
+    if dropout > 0:
+      model += [nn.Dropout(p=dropout)]
+    self.model = nn.Sequential(*model)
+    self.model.apply(gaussian_weights_init)
+  def forward(self, x):
+    residual = x
+    out = self.model(x)
+    out += residual
+    return out
 
-    row1 = torch.cat((images_a[0:1, ::], images_a1[0:1, ::], images_a3[0:1, ::]),3)
-    row2 = torch.cat((images_b[0:1, ::], images_b1[0:1, ::], images_b3[0:1, ::]),3)    
-    row3 = torch.cat((images_mask_a1[0:1, ::], images_mask_a2[0:1, ::], images_mask_a3[0:1, ::]),3) 
-    row4 = torch.cat((images_mask_a4[0:1, ::], images_mask_a5[0:1, ::], images_mask_a6[0:1, ::]),3)    
-    row5 = torch.cat((images_mask_b1[0:1, ::], images_mask_b2[0:1, ::], images_mask_b3[0:1, ::]),3) 
-    row6 = torch.cat((images_mask_b4[0:1, ::], images_mask_b5[0:1, ::], images_mask_b6[0:1, ::]),3)    
-    return torch.cat((row1,row2),2), torch.cat((row3,row4), 2), torch.cat((row5,row6), 2)
+class MisINSResBlock(nn.Module):
+  def conv3x3(self, dim_in, dim_out, stride=1):
+    return nn.Sequential(nn.ReflectionPad2d(1), nn.Conv2d(dim_in, dim_out, kernel_size=3, stride=stride))
+  def conv1x1(self, dim_in, dim_out):
+    return nn.Conv2d(dim_in, dim_out, kernel_size=1, stride=1, padding=0)
+  def __init__(self, dim, dim_extra, stride=1, dropout=0.0):
+    super(MisINSResBlock, self).__init__()
+    self.conv1 = nn.Sequential(
+        self.conv3x3(dim, dim, stride),
+        nn.InstanceNorm2d(dim))
+    self.conv2 = nn.Sequential(
+        self.conv3x3(dim, dim, stride),
+        nn.InstanceNorm2d(dim))
+    self.blk1 = nn.Sequential(
+        self.conv1x1(dim + dim_extra, dim + dim_extra),
+        nn.ReLU(inplace=False),
+        self.conv1x1(dim + dim_extra, dim),
+        nn.ReLU(inplace=False))
+    self.blk2 = nn.Sequential(
+        self.conv1x1(dim + dim_extra, dim + dim_extra),
+        nn.ReLU(inplace=False),
+        self.conv1x1(dim + dim_extra, dim),
+        nn.ReLU(inplace=False))
+    model = []
+    if dropout > 0:
+      model += [nn.Dropout(p=dropout)]
+    self.model = nn.Sequential(*model)
+    self.model.apply(gaussian_weights_init)
+    self.conv1.apply(gaussian_weights_init)
+    self.conv2.apply(gaussian_weights_init)
+    self.blk1.apply(gaussian_weights_init)
+    self.blk2.apply(gaussian_weights_init)
+  def forward(self, x, z):
+    residual = x
+    z_expand = z.view(z.size(0), z.size(1), 1, 1).expand(z.size(0), z.size(1), x.size(2), x.size(3))
+    o1 = self.conv1(x)
+    o2 = self.blk1(torch.cat([o1, z_expand], dim=1))
+    o3 = self.conv2(o2)
+    out = self.blk2(torch.cat([o3, z_expand], dim=1))
+    out += residual
+    return out
 
-  def normalize_image(self, x):
-    return x[:,0:3,:,:]
+class GaussianNoiseLayer(nn.Module):
+  def __init__(self,):
+    super(GaussianNoiseLayer, self).__init__()
+  def forward(self, x):
+    if self.training == False:
+      return x
+    noise = Variable(torch.randn(x.size()).cuda(x.get_device()))
+    return x + noise
+
+class ReLUINSConvTranspose2d(nn.Module):
+  def __init__(self, n_in, n_out, kernel_size, stride, padding, output_padding):
+    super(ReLUINSConvTranspose2d, self).__init__()
+    model = []
+    model += [nn.ConvTranspose2d(n_in, n_out, kernel_size=kernel_size, stride=stride, padding=padding, output_padding=output_padding, bias=True)]
+    model += [LayerNorm(n_out)]
+    model += [nn.ReLU(inplace=True)]
+    self.model = nn.Sequential(*model)
+    self.model.apply(gaussian_weights_init)
+  def forward(self, x):
+    return self.model(x)
+
+####################################################################
+#--------------------- Spectral Normalization ---------------------
+####################################################################
+class SpectralNorm(object):
+  def __init__(self, name='weight', n_power_iterations=1, dim=0, eps=1e-12):
+    self.name = name
+    self.dim = dim
+    if n_power_iterations <= 0:
+      raise ValueError('Expected n_power_iterations to be positive, but '
+                       'got n_power_iterations={}'.format(n_power_iterations))
+    self.n_power_iterations = n_power_iterations
+    self.eps = eps
+  def compute_weight(self, module):
+    weight = getattr(module, self.name + '_orig')
+    u = getattr(module, self.name + '_u')
+    weight_mat = weight
+    if self.dim != 0:
+      # permute dim to front
+      weight_mat = weight_mat.permute(self.dim,
+                                            *[d for d in range(weight_mat.dim()) if d != self.dim])
+    height = weight_mat.size(0)
+    weight_mat = weight_mat.reshape(height, -1)
+    with torch.no_grad():
+      for _ in range(self.n_power_iterations):
+        v = F.normalize(torch.matmul(weight_mat.t(), u), dim=0, eps=self.eps)
+        u = F.normalize(torch.matmul(weight_mat, v), dim=0, eps=self.eps)
+    sigma = torch.dot(u, torch.matmul(weight_mat, v))
+    weight = weight / sigma
+    return weight, u
+  def remove(self, module):
+    weight = getattr(module, self.name)
+    delattr(module, self.name)
+    delattr(module, self.name + '_u')
+    delattr(module, self.name + '_orig')
+    module.register_parameter(self.name, torch.nn.Parameter(weight))
+  def __call__(self, module, inputs):
+    if module.training:
+      weight, u = self.compute_weight(module)
+      setattr(module, self.name, weight)
+      setattr(module, self.name + '_u', u)
+    else:
+      r_g = getattr(module, self.name + '_orig').requires_grad
+      getattr(module, self.name).detach_().requires_grad_(r_g)
+
+  @staticmethod
+  def apply(module, name, n_power_iterations, dim, eps):
+    fn = SpectralNorm(name, n_power_iterations, dim, eps)
+    weight = module._parameters[name]
+    height = weight.size(dim)
+    u = F.normalize(weight.new_empty(height).normal_(0, 1), dim=0, eps=fn.eps)
+    delattr(module, fn.name)
+    module.register_parameter(fn.name + "_orig", weight)
+    module.register_buffer(fn.name, weight.data)
+    module.register_buffer(fn.name + "_u", u)
+    module.register_forward_pre_hook(fn)
+    return fn
+
+def spectral_norm(module, name='weight', n_power_iterations=1, eps=1e-12, dim=None):
+  if dim is None:
+    if isinstance(module, (torch.nn.ConvTranspose1d,
+                           torch.nn.ConvTranspose2d,
+                           torch.nn.ConvTranspose3d)):
+      dim = 1
+    else:
+      dim = 0
+  SpectralNorm.apply(module, name, n_power_iterations, dim, eps)
+  return module
+
+def remove_spectral_norm(module, name='weight'):
+  for k, hook in module._forward_pre_hooks.items():
+    if isinstance(hook, SpectralNorm) and hook.name == name:
+      hook.remove(module)
+      del module._forward_pre_hooks[k]
+      return module
+  raise ValueError("spectral_norm of '{}' not found in {}".format(name, module))
