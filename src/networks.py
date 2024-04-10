@@ -306,19 +306,21 @@ class Vgg16(torch.nn.Module):
         return relu3_3
 
 def init_vgg16(model_folder):
-	"""load the vgg16 model feature"""
-	if not os.path.exists(os.path.join(model_folder, 'vgg16.weight')):
-		if not os.path.exists(os.path.join(model_folder, 'vgg16.t7')):
-			os.system(				# 下载vgg16.t7文件 X vgg16.pth
-				'wget https://download.pytorch.org/models/vgg16-397923af.pth ' + os.path.join(model_folder, 'vgg16.t7'))
-		#vgglua = load_lua(os.path.join(model_folder, 'vgg16.t7'))
-    		#vgglua = load_lua(os.path.join(model_dir, 'vgg16.t7'),long_size =8 ）
-		#vgglua = torchfile.load(os.path.join(model_folder, 'vgg16.pth'))
-		vgglua = torch.load(os.path.join(model_folder, 'vgg16.pth'))
-		vgg = Vgg16()
-		for (src, dst) in zip(vgglua.parameters()[0], vgg.parameters()):
-			dst.data[:] = src
-		torch.save(vgg.state_dict(), os.path.join(model_folder, 'vgg16.weight'))
+    """load the vgg16 model feature"""
+    if not os.path.exists(os.path.join(model_folder, 'vgg16.weight')):
+        if not os.path.exists(os.path.join(model_folder, 'vgg16.pth')):
+            os.system(
+                'wget https://download.pytorch.org/models/vgg16-397923af.pth ' + os.path.join(model_folder, 'vgg16.pth'))
+        #vgglua = load_lua(os.path.join(model_folder, 'vgg16.t7'))
+        #vgglua = load_lua(os.path.join(model_dir, 'vgg16.t7'),long_size =8 ）
+	#vgglua = torchfile.load(os.path.join(model_folder, 'vgg16.pth'))
+        vgglua = torch.load(os.path.join(model_folder, 'vgg16.pth'))
+        vgg = Vgg16()
+        vgg.load_state_dict(vgglua)
+
+        for src, dst in zip(vgg.parameters(), vgg.parameters()):
+            dst.data[:] = src
+        torch.save(vgg.state_dict(), os.path.join(model_folder, 'vgg16.weight'))
 
 def define_vgg(path):
     vgg = Vgg16()
