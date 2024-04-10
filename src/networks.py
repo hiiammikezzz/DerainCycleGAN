@@ -313,7 +313,8 @@ def init_vgg16(model_folder):
 				'wget https://download.pytorch.org/models/vgg16-397923af.pth ' + os.path.join(model_folder, 'vgg16.t7'))
 		#vgglua = load_lua(os.path.join(model_folder, 'vgg16.t7'))
     		#vgglua = load_lua(os.path.join(model_dir, 'vgg16.t7'),long_size =8 ）
-		vgglua = torchfile.load(os.path.join(model_folder, 'vgg16.pth'))
+		#vgglua = torchfile.load(os.path.join(model_folder, 'vgg16.pth'))
+		vgglua = torch.load(os.path.join(model_folder, 'vgg16.pth'))
 		vgg = Vgg16()
 		for (src, dst) in zip(vgglua.parameters()[0], vgg.parameters()):
 			dst.data[:] = src
