@@ -112,8 +112,8 @@ def main():
     if ep == ep0:
         best_psnr = psnr_avg
         best_ssim = ssim_avg
-
-    print("[epoch %d][%d/%d] ssim_avg: %.4f, psnr_avg: %.4f, best_ssim: %.4f, best_psnr: %.4f" %
+    if total_it % 100 == 0 :
+      print("[epoch %d][%d/%d] ssim_avg: %.4f, psnr_avg: %.4f, best_ssim: %.4f, best_psnr: %.4f" %
             (ep+1, i+1, len(loader_val), ssim_avg, psnr_avg, best_ssim, best_psnr)) 
 
     if (ssim_avg >= best_ssim) and (psnr_avg >= best_psnr):
